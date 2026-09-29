@@ -1,0 +1,223 @@
+import express from 'express';
+import cors from 'cors';
+import { GoogleGenAI } from '@google/genai';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// Query the YouTube Search API
+async function fetchYouTubeVideos(query, maxResults = 3) {
+  if (!YOUTUBE_API_KEY) return [];
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=${maxResults}&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.items) return [];
+
+    return data.items.map(item => ({
+      id: item.id.videoId,
+      title: item.snippet.title,
+      thumbnail: item.snippet.thumbnails?.medium?.url || '',
+      url: `https://www.youtube.com/watch?v=${item.id.videoId}`
+    }));
+  } catch (err) {
+    console.error('YouTube API error:', err);
+    return [];
+  }
+}
+
+// Check if user specifically requested video/watch recommendations
+function wantsVideos(text) {
+  const keywords = ['video', 'videos', 'watch', 'youtube', 'tutorial', 'clip', 'stream'];
+  return keywords.some(k => text.toLowerCase().includes(k));
+}
+
+// API Endpoint for Chat
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+
+    let videos = [];
+    const needsVideos = wantsVideos(prompt);
+
+    if (needsVideos) {
+      videos = await fetchYouTubeVideos(prompt);
+    }
+
+    const systemPrompt = `You are a helpful AI chatbot. Answer questions clearly and directly. 
+${needsVideos && videos.length > 0 
+  ? `The user requested video recommendations. The following YouTube videos were retrieved: ${JSON.stringify(videos.map(v => v.title))}. Summarize an answer and briefly reference the topics covered in these videos.` 
+  : 'If the user does not request video materials, simply answer the question thoroughly without mentioning video searches.'}`;
+
+    const geminiResponse = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        { role: 'user', parts: [{ text: `${systemPrompt}\n\nUser Question: ${prompt}` }] }
+      ]
+    });
+
+    res.json({
+      reply: geminiResponse.text,
+      videos: videos
+    });
+  } catch (error) {
+    console.error('Gemini error:', error);
+    res.status(500).json({ error: 'Failed to process request.' });
+  }
+});
+
+// Single-page UI delivery
+app.get('/', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Chatbox</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    .chat-container { width: 100%; max-width: 680px; height: 90vh; background: #1e293b; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 40px rgba(0,0,0,0.6); }
+    .header { padding: 14px 18px; background: #334155; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #475569; }
+    .header h2 { margin: 0; font-size: 1rem; color: #94a3b8; }
+    .auth-buttons button { background: #fff; color: #0f172a; border: none; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem; margin-left: 6px; }
+    .auth-buttons button:hover { background: #e2e8f0; }
+    .messages { flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 80%; padding: 10px 14px; border-radius: 8px; line-height: 1.5; font-size: 0.95rem; word-break: break-word; }
+    .msg.user { align-self: flex-end; background: #2563eb; color: #fff; }
+    .msg.bot { align-self: flex-start; background: #334155; color: #f8fafc; }
+    .input-box { display: flex; padding: 12px; background: #0f172a; border-top: 1px solid #334155; }
+    .input-box input { flex: 1; padding: 10px 14px; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; outline: none; }
+    .input-box button { background: #2563eb; color: #fff; border: none; padding: 0 18px; margin-left: 8px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    .video-card { display: flex; gap: 10px; background: #0f172a; border-radius: 6px; overflow: hidden; margin-top: 10px; text-decoration: none; color: #fff; padding: 6px; border: 1px solid #475569; }
+    .video-card img { width: 100px; height: 60px; object-fit: cover; border-radius: 4px; }
+    .video-info { display: flex; align-items: center; font-size: 0.85rem; font-weight: 500; }
+  </style>
+
+  <!-- Firebase Auth Module -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.9.0/firebase-app.js";
+    import { getAuth, signInWithPopup, GoogleAuthProvider, OAuthProvider, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.9.0/firebase-auth.js";
+
+    // PASTE YOUR FIREBASE WEB APP CONFIG HERE:
+    const firebaseConfig = {
+      apiKey: "YOUR_FIREBASE_API_KEY",
+      authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+      projectId: "YOUR_PROJECT_ID",
+      appId: "YOUR_APP_ID"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+
+    const googleBtn = document.getElementById("google-login");
+    const appleBtn = document.getElementById("apple-login");
+    const logoutBtn = document.getElementById("logout-btn");
+    const userLabel = document.getElementById("user-label");
+
+    googleBtn.onclick = () => signInWithPopup(auth, new GoogleAuthProvider()).catch(console.error);
+    appleBtn.onclick = () => signInWithPopup(auth, new OAuthProvider('apple.com')).catch(console.error);
+    logoutBtn.onclick = () => signOut(auth);
+
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        googleBtn.style.display = "none";
+        appleBtn.style.display = "none";
+        logoutBtn.style.display = "inline-block";
+        userLabel.innerText = user.displayName ? \`Signed in as \${user.displayName}\` : user.email;
+      } else {
+        googleBtn.style.display = "inline-block";
+        appleBtn.style.display = "inline-block";
+        logoutBtn.style.display = "none";
+        userLabel.innerText = "Please sign in";
+      }
+    });
+  </script>
+</head>
+<body>
+
+<div class="chat-container">
+  <div class="header">
+    <h2 id="user-label">Please sign in</h2>
+    <div class="auth-buttons">
+      <button id="google-login">Sign in with Google</button>
+      <button id="apple-login">Sign in with Apple</button>
+      <button id="logout-btn" style="display: none;">Sign Out</button>
+    </div>
+  </div>
+
+  <div class="messages" id="chat">
+    <div class="msg bot">Hello! Ask me any question, or ask for videos on any topic you want to watch.</div>
+  </div>
+
+  <form class="input-box" id="chat-form">
+    <input type="text" id="user-input" placeholder="Type a message or ask for videos..." autocomplete="off" required />
+    <button type="submit">Send</button>
+  </form>
+</div>
+
+<script>
+  const form = document.getElementById('chat-form');
+  const input = document.getElementById('user-input');
+  const chat = document.getElementById('chat');
+
+  function appendMessage(text, role, videos = []) {
+    const bubble = document.createElement('div');
+    bubble.className = \`msg \${role}\`;
+    bubble.innerText = text;
+
+    if (videos && videos.length > 0) {
+      videos.forEach(v => {
+        const card = document.createElement('a');
+        card.className = 'video-card';
+        card.href = v.url;
+        card.target = '_blank';
+        card.rel = 'noopener noreferrer';
+        card.innerHTML = \`
+          <img src="\${v.thumbnail}" alt="Thumbnail" />
+          <div class="video-info"><span>\${v.title}</span></div>
+        \`;
+        bubble.appendChild(card);
+      });
+    }
+
+    chat.appendChild(bubble);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const query = input.value.trim();
+    if (!query) return;
+
+    appendMessage(query, 'user');
+    input.value = '';
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: query })
+      });
+      const data = await response.json();
+      appendMessage(data.reply, 'bot', data.videos);
+    } catch (err) {
+      appendMessage('Unable to reach server. Please try again.', 'bot');
+    }
+  });
+</script>
+
+</body>
+</html>`);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server live at http://localhost:${PORT}`);
+});
